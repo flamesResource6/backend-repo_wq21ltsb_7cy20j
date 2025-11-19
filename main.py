@@ -1,12 +1,12 @@
 import os
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from datetime import datetime
 
-from database import db, create_document, get_documents
-from schemas import Listing
+from database import db, create_document, get_documents, upsert_document, update_by_id, aggregate
+from schemas import Listing, SavedSearch, Alert
 
 app = FastAPI(title="Tunisia Real Estate Aggregator API")
 
@@ -24,7 +24,7 @@ class CreateListing(BaseModel):
 
 @app.get("/")
 def read_root():
-    return {"name": "Tunisia Real Estate Aggregator API", "version": 1}
+    return {"name": "Tunisia Real Estate Aggregator API", "version": 2}
 
 @app.get("/test")
 def test_database():
@@ -54,11 +54,19 @@ def test_database():
         response["database"] = f"❌ Error: {str(e)[:80]}"
     return response
 
+# ---------------------------
+# Listings: Create + List
+# ---------------------------
 @app.post("/api/listings", response_model=dict)
 def create_listing(payload: CreateListing):
     try:
-        inserted_id = create_document("listing", payload.listing)
-        return {"inserted_id": inserted_id}
+        # Create dedup key (url OR title+price+posted_at)
+        l = payload.listing.model_dump()
+        dedup_key = l.get('url') or f"{l.get('title','')}-{l.get('price','')}-{l.get('posted_at','')}"
+        l['dedup_key'] = dedup_key
+        # Upsert by dedup_key
+        _id, is_new = upsert_document("listing", {"dedup_key": dedup_key}, l)
+        return {"id": _id, "created": is_new}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -76,7 +84,7 @@ def list_listings(
     limit: int = Query(50, ge=1, le=200)
 ):
     try:
-        filter_dict = {}
+        filter_dict: Dict[str, Any] = {"status": {"$ne": "rejected"}}
         if city:
             filter_dict["city"] = {"$regex": city, "$options": "i"}
         if deal_type:
@@ -109,7 +117,7 @@ def list_listings(
                 {"city": {"$regex": q, "$options": "i"}},
             ]
 
-        docs = get_documents("listing", filter_dict, limit)
+        docs = get_documents("listing", filter_dict, limit, sort=[["posted_at", -1], ["created_at", -1]])
         # Serialize ObjectId and datetimes if present
         for d in docs:
             if "_id" in d:
@@ -120,6 +128,146 @@ def list_listings(
         return docs
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# ---------------------------
+# Saved Searches & Alerts
+# ---------------------------
+@app.post("/api/saved-searches", response_model=dict)
+def create_saved_search(search: SavedSearch):
+    try:
+        _id = create_document("savedsearch", search)
+        return {"id": _id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/saved-searches", response_model=List[dict])
+def list_saved_searches(limit: int = 50):
+    try:
+        docs = get_documents("savedsearch", {}, limit, sort=[["created_at", -1]])
+        for d in docs:
+            d["id"] = str(d.pop("_id"))
+            if isinstance(d.get("created_at"), datetime):
+                d["created_at"] = d["created_at"].isoformat()
+        return docs
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Minimal endpoint to record an alert sent (hook for future email/telegram integrations)
+@app.post("/api/alerts", response_model=dict)
+def record_alert(alert: Alert):
+    try:
+        _id = create_document("alert", alert)
+        return {"id": _id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ---------------------------
+# Admin moderation
+# ---------------------------
+@app.post("/api/listings/{listing_id}/approve", response_model=dict)
+def approve_listing(listing_id: str):
+    try:
+        modified = update_by_id("listing", listing_id, {"status": "approved"})
+        return {"updated": modified}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/listings/{listing_id}/reject", response_model=dict)
+def reject_listing(listing_id: str):
+    try:
+        modified = update_by_id("listing", listing_id, {"status": "rejected"})
+        return {"updated": modified}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ---------------------------
+# Analytics
+# ---------------------------
+@app.get("/api/analytics/summary", response_model=dict)
+def analytics_summary(city: Optional[str] = None, deal_type: Optional[str] = None, property_type: Optional[str] = None):
+    try:
+        match: Dict[str, Any] = {"status": {"$ne": "rejected"}}
+        if city:
+            match["city"] = {"$regex": city, "$options": "i"}
+        if deal_type:
+            match["deal_type"] = deal_type
+        if property_type:
+            match["property_type"] = property_type
+
+        pipeline = [
+            {"$match": match},
+            {"$group": {
+                "_id": {
+                    "city": "$city",
+                    "property_type": "$property_type",
+                    "deal_type": "$deal_type"
+                },
+                "count": {"$sum": 1},
+                "median_price": {"$median": "$price"},
+                "avg_price": {"$avg": "$price"}
+            }},
+            {"$sort": {"count": -1}}
+        ]
+        results = aggregate("listing", pipeline)
+        # normalize keys
+        for r in results:
+            r["city"] = r.pop("_id", {}).get("city")
+            r["property_type"] = r.get("property_type") or None
+        return {"groups": results}
+    except Exception as e:
+        # in case $median not supported, fallback simple stats
+        try:
+            pipeline = [
+                {"$match": match},
+                {"$group": {
+                    "_id": {
+                        "city": "$city",
+                        "property_type": "$property_type",
+                        "deal_type": "$deal_type"
+                    },
+                    "count": {"$sum": 1},
+                    "avg_price": {"$avg": "$price"},
+                    "min_price": {"$min": "$price"},
+                    "max_price": {"$max": "$price"}
+                }},
+                {"$sort": {"count": -1}}
+            ]
+            results = aggregate("listing", pipeline)
+            for r in results:
+                r["city"] = r.pop("_id", {}).get("city")
+            return {"groups": results, "note": "median not available; showing avg/min/max"}
+        except Exception as e2:
+            raise HTTPException(status_code=500, detail=str(e2))
+
+# ---------------------------
+# Ingestion webhook placeholders (scrapers will call these)
+# ---------------------------
+@app.post("/ingest/{source}")
+def ingest_source(source: str, payload: Dict[str, Any] = Body(...)):
+    """
+    Generic ingestion endpoint for connectors/scrapers.
+    Accepts either a single listing or a list of listings under `items`.
+    Deduplicates using url or title+price+posted_at.
+    """
+    if source not in {"facebook", "tayara", "tunisie-annonces", "other"}:
+        raise HTTPException(status_code=400, detail="Unsupported source")
+
+    items = payload.get("items") or [payload]
+    created, updated = 0, 0
+    ids: List[str] = []
+    for it in items:
+        it = dict(it)
+        it['source'] = source
+        # build dedup key
+        dedup_key = it.get('url') or f"{it.get('title','')}-{it.get('price','')}-{it.get('posted_at','')}"
+        it['dedup_key'] = dedup_key
+        _id, is_new = upsert_document("listing", {"dedup_key": dedup_key}, it)
+        ids.append(_id)
+        if is_new:
+            created += 1
+        else:
+            updated += 1
+    return {"created": created, "updated": updated, "ids": ids}
 
 if __name__ == "__main__":
     import uvicorn
